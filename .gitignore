@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+ec2_key.pem
+*.log
+logs/
+.env

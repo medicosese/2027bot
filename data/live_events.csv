@@ -1,0 +1,2 @@
+event_id,timestamp,event_type,trade_id,symbol,side,price,qty,notional,fee,funding,realized_pnl,cash_balance,total_equity,gross_exposure,portfolio_leverage,message
+EVT-0000000,2026-10-09T15:42:52.615138+00:00,INITIAL_DEPOSIT,NONE,ACCOUNT,NONE,0.0,0.0,0.0,0.0,0.0,0.0,50.0,50.0,0.0,0.0,Account initialized with $50.00 starting capital
