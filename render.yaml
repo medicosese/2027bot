@@ -16,6 +16,6 @@ services:
       - key: TAMA_CAPITAL_MODE
         value: EXCHANGE_DYNAMIC
       - key: BINANCE_TESTNET_KEY
-        value: FDxE4FGFdMnu2Vbi28BmxUxDWOv0JpKFDMYEyoevet4jUoc4u0drCQDg7mkdm2cZ
+        sync: false
       - key: BINANCE_TESTNET_SECRET
-        value: gNmxDxB2V0d5mTwEM0Gm1maipDC5LShul9TsvAUGVtXLzliMt9zoy78hfRzxjqeX
+        sync: false

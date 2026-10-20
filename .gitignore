@@ -4,3 +4,13 @@ ec2_key.pem
 *.log
 logs/
 .env
+*.db
+data/
+test_new_keys.py
+stop_all_running_trades.py
+close_orphaned_position.py
+find_balance_history.py
+inspect_historical_dbs.py
+investigate_near_trade.py
+query_actual_binance_balance.py
+init_fresh_state.py

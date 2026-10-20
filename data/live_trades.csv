@@ -1,1 +1,0 @@
-trade_id,symbol,side,status,entry_time,exit_time,entry_price,exit_price,qty,notional,stop_loss,entry_fee,exit_fee,cum_funding,gross_pnl,net_pnl,balance_after,bars_held,is_intrabar,exit_reason
