@@ -213,46 +213,53 @@ class BinanceTradeBridge:
     def place_limit_order(self, symbol: str, side: str, qty: float, price: float) -> Dict:
         """Place Maker Limit order."""
         sym = symbol.upper()
+        norm_side = "BUY" if side.upper() in ["BUY", "LONG"] else "SELL"
         rounded_p = self.round_price(sym, price)
         rounded_q = self.round_qty(sym, qty)
         
         params = {
             'symbol': sym,
-            'side': side.upper(),
+            'side': norm_side,
             'type': 'LIMIT',
             'timeInForce': 'GTC',
             'quantity': rounded_q,
             'price': rounded_p
         }
-        self.logger.info(f"Placing LIMIT {side} {sym}: qty={rounded_q}, price={rounded_p}")
+        self.logger.info(f"Placing LIMIT {norm_side} {sym}: qty={rounded_q}, price={rounded_p}")
         return self._send_signed_request('POST', '/fapi/v1/order', params)
         
     def place_market_order(self, symbol: str, side: str, qty: float) -> Dict:
         """Place Market order."""
         sym = symbol.upper()
+        norm_side = "BUY" if side.upper() in ["BUY", "LONG"] else "SELL"
         rounded_q = self.round_qty(sym, qty)
         params = {
             'symbol': sym,
-            'side': side.upper(),
+            'side': norm_side,
             'type': 'MARKET',
             'quantity': rounded_q
         }
-        self.logger.info(f"Placing MARKET {side} {sym}: qty={rounded_q}")
+        self.logger.info(f"Placing MARKET {norm_side} {sym}: qty={rounded_q}")
         return self._send_signed_request('POST', '/fapi/v1/order', params)
         
     def place_stop_loss_order(self, symbol: str, side: str, stop_price: float) -> Dict:
-        """Place STOP_MARKET order with closePosition=true."""
+        """Place STOP_MARKET conditional order via Binance Algo API."""
         sym = symbol.upper()
+        norm_side = "BUY" if side.upper() in ["BUY", "SHORT"] else "SELL"
         rounded_sp = self.round_price(sym, stop_price)
         params = {
             'symbol': sym,
-            'side': side.upper(),
+            'side': norm_side,
             'type': 'STOP_MARKET',
-            'stopPrice': rounded_sp,
+            'algoType': 'CONDITIONAL',
+            'triggerPrice': rounded_sp,
             'closePosition': 'true'
         }
-        self.logger.info(f"Placing STOP_MARKET {side} {sym}: stopPrice={rounded_sp}")
-        return self._send_signed_request('POST', '/fapi/v1/order', params)
+        self.logger.info(f"Placing ALGO STOP_MARKET {norm_side} {sym}: triggerPrice={rounded_sp}")
+        res = self._send_signed_request('POST', '/fapi/v1/algoOrder', params)
+        if isinstance(res, dict) and 'algoId' in res:
+            res['orderId'] = res['algoId']
+        return res
         
     def cancel_order(self, symbol: str, order_id: int) -> Dict:
         """Cancel an open order."""
@@ -263,6 +270,11 @@ class BinanceTradeBridge:
         return self._send_signed_request('DELETE', '/fapi/v1/order', params)
         
     def cancel_all_orders(self, symbol: str) -> Dict:
-        """Cancel all open orders for a symbol."""
-        params = {'symbol': symbol.upper()}
-        return self._send_signed_request('DELETE', '/fapi/v1/allOpenOrders', params)
+        """Cancel all open orders and algo orders for a symbol."""
+        sym = symbol.upper()
+        res = self._send_signed_request('DELETE', '/fapi/v1/allOpenOrders', {'symbol': sym})
+        try:
+            self._send_signed_request('DELETE', '/fapi/v1/algo/allOpenOrders', {'symbol': sym})
+        except Exception:
+            pass
+        return res
