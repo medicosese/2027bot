@@ -61,6 +61,8 @@ class TamaLiveEngine:
         self.last_exit_bar: Dict[str, int] = {s: -999 for s in SYMBOLS}
         self.bar_index: Dict[str, int] = {s: 0 for s in SYMBOLS}
         self.latest_prices: Dict[str, float] = {s: 0.0 for s in SYMBOLS}
+        self.last_kline_time: Optional[str] = None
+        self.kline_messages_received: int = 0
         
         # Recover open positions from SQLite if resuming
         self._recover_state()
@@ -603,7 +605,7 @@ class TamaLiveEngine:
         """Connects to Binance Futures multi-stream WebSocket."""
         stream_names = [f"{s.lower()}@kline_15m" for s in SYMBOLS]
         stream_path = "/".join(stream_names)
-        ws_url = f"wss://fstream.binance.com/stream?streams={stream_path}"
+        ws_url = f"wss://fstream.binance.com/market/stream?streams={stream_path}"
         
         def on_message(ws, message):
             try:
@@ -611,6 +613,8 @@ class TamaLiveEngine:
                 if 'data' in data:
                     payload = data['data']
                     if payload.get('e') == 'kline':
+                        self.kline_messages_received += 1
+                        self.last_kline_time = datetime.datetime.now(datetime.timezone.utc).isoformat()
                         s = payload['s']
                         k = payload['k']
                         is_closed = k['x']

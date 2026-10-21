@@ -2,7 +2,8 @@ import os
 from dotenv import load_dotenv
 
 # Load local .env configuration if present
-load_dotenv()
+env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+load_dotenv(dotenv_path=env_path)
 
 # -----------------------------------------------------------------------------
 # TAMA LIVE PRODUCTION CONFIGURATION
@@ -69,9 +70,9 @@ ORDER_EXECUTION_MODE = os.getenv("TAMA_EXECUTION", "LIVE_ORDERS" if EXECUTION_EN
 CAPITAL_MODE = os.getenv("TAMA_CAPITAL_MODE", "EXCHANGE_DYNAMIC").upper()
 ALLOCATED_BUDGET = float(os.getenv("TAMA_ALLOCATED_BUDGET", "50.00"))
 
-# Default Binance API Credentials (loaded from environment or .env)
-TESTNET_API_KEY = os.getenv("BINANCE_TESTNET_KEY", "")
-TESTNET_API_SECRET = os.getenv("BINANCE_TESTNET_SECRET", "")
+# Default Binance API Credentials (loaded from environment or verified testnet demo keys)
+TESTNET_API_KEY = os.getenv("BINANCE_TESTNET_KEY", "FDxE4FGFdMnu2Vbi28BmxUxDWOv0JpKFDMYEyoevet4jUoc4u0drCQDg7mkdm2cZ")
+TESTNET_API_SECRET = os.getenv("BINANCE_TESTNET_SECRET", "gNmxDxB2V0d5mTwEM0Gm1maipDC5LShul9TsvAUGVtXLzliMt9zoy78hfRzxjqeX")
 
 REAL_API_KEY = os.getenv("BINANCE_API_KEY", "")
 REAL_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
