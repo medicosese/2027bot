@@ -13,7 +13,7 @@ from typing import Dict, List, Optional, Any
 
 from config import (
     SYMBOLS, RISK_PER_TRADE, MAX_PORTFOLIO_LEVERAGE,
-    LEVERAGE_HEADROOM_CAP, COOLDOWN_BARS, FILL_PENETRATION_ATR, MIN_NOTIONAL,
+    LEVERAGE_HEADROOM_CAP, MAX_SINGLE_ASSET_EXPOSURE, COOLDOWN_BARS, FILL_PENETRATION_ATR, MIN_NOTIONAL,
     MAX_NOTIONAL_CAP, MAKER_FEE_RATE, TAKER_FEE_RATE, BASE_FUNDING_RATE,
     SLIPPAGE_MAP, TIMEFRAME, ATR_PERIOD, ADX_PERIOD, ADX_THRESHOLD,
     EMA_FAST, EMA_SLOW, SUPERTREND_PERIOD, SUPERTREND_MULTIPLIER, WARMUP_BARS,
@@ -122,6 +122,37 @@ class TamaLiveEngine:
                 'stop_order_id': None
             }
             logger.info(f"Recovered active position from DB: {s} {p['side']} {p['qty']} @ ${p['entry_price']:.2f}")
+
+        # Synchronize directly with Binance Exchange Ground Truth
+        if self.bridge:
+            try:
+                live_pos = self.bridge.get_open_positions()
+                for lp in live_pos:
+                    s = lp.get('symbol')
+                    amt = float(lp.get('positionAmt', 0))
+                    if s in SYMBOLS and amt != 0:
+                        side = 'LONG' if amt > 0 else 'SHORT'
+                        entry_p = float(lp.get('entryPrice', 0))
+                        mark_p = float(lp.get('markPrice', entry_p))
+                        notional = abs(amt * mark_p)
+                        self.positions[s] = {
+                            'trade_id': f"REC-{int(time.time()*1000)}",
+                            'symbol': s,
+                            'side': side,
+                            'entry_time': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                            'entry_price': entry_p,
+                            'qty': abs(amt),
+                            'notional': notional,
+                            'sl': entry_p * 1.05 if side == 'SHORT' else entry_p * 0.95,
+                            'entry_fee': 0.0,
+                            'cum_funding': 0.0,
+                            'bars_held': 1,
+                            'exchange_order_id': None,
+                            'stop_order_id': None
+                        }
+                        logger.info(f"Synchronized live exchange position on startup: {s} {side} {abs(amt)} @ ${entry_p:,.2f} (Notional: ${notional:,.2f})")
+            except Exception as e:
+                logger.error(f"Error recovering live exchange positions: {e}")
 
     def fetch_warmup_candles(self, symbol: str, limit: int = WARMUP_BARS) -> pd.DataFrame:
         url = "https://fapi.binance.com/fapi/v1/klines"
@@ -495,6 +526,17 @@ class TamaLiveEngine:
             
         # 3. Check Signal Generation for New Position
         if self.positions[symbol] is None and self.pending_orders[symbol] is None:
+            # Exchange Ground Truth Verification: Prevent pyramiding if position exists on Binance
+            if ORDER_EXECUTION_MODE == "LIVE_ORDERS" and self.bridge:
+                try:
+                    live_positions = self.bridge.get_open_positions()
+                    if any(lp.get('symbol') == symbol and abs(float(lp.get('positionAmt', 0))) > 0 for lp in live_positions):
+                        logger.warning(f"ANTI-PYRAMIDING LOCK: Active exchange position detected for {symbol}. Signal generation skipped.")
+                        return
+                except Exception as e:
+                    logger.error(f"Error checking exchange positions in on_candle_close: {e}")
+                    return
+
             if (curr_bar - self.last_exit_bar[symbol]) >= COOLDOWN_BARS:
                 side = None
                 sl = None
@@ -521,33 +563,90 @@ class TamaLiveEngine:
         if stop_dist <= 1e-8:
             return
             
+        # 1. Anti-Pyramiding Lock: Check both in-memory state and Binance exchange truth
+        if self.positions.get(symbol) is not None:
+            logger.warning(f"ANTI-PYRAMIDING LOCK: Position already tracked in memory for {symbol}. Staging aborted.")
+            return
+
+        if ORDER_EXECUTION_MODE == "LIVE_ORDERS" and self.bridge:
+            try:
+                live_positions = self.bridge.get_open_positions()
+                for lp in live_positions:
+                    if lp.get('symbol') == symbol and abs(float(lp.get('positionAmt', 0))) > 0:
+                        logger.warning(f"ANTI-PYRAMIDING LOCK: Active Binance position detected for {symbol} ({lp.get('positionAmt')}). Staging aborted.")
+                        return
+            except Exception as e:
+                logger.error(f"Error checking Binance open positions in _stage_pending_order: {e}")
+                return
+
+        # 2. Reconcile Cash Balance with Live Exchange
         cash = self.state.get_latest_cash_balance()
-        current_active = sum(p['notional'] for p in self.positions.values() if p is not None)
+        if ORDER_EXECUTION_MODE == "LIVE_ORDERS" and self.bridge:
+            try:
+                ex_balance = self.bridge.get_wallet_balance()
+                if ex_balance is not None and ex_balance > 0:
+                    cash = ex_balance
+            except Exception as e:
+                logger.error(f"Error querying live wallet balance for sizing: {e}")
+
+        # 3. Calculate True Committed Exposure across the entire portfolio
+        local_notional = sum(p['notional'] for p in self.positions.values() if p is not None)
+        exchange_notional = 0.0
+        if ORDER_EXECUTION_MODE == "LIVE_ORDERS" and self.bridge:
+            try:
+                live_positions = self.bridge.get_open_positions()
+                for lp in live_positions:
+                    amt = abs(float(lp.get('positionAmt', 0)))
+                    mp = float(lp.get('markPrice', lp.get('entryPrice', 0)))
+                    exchange_notional += (amt * mp)
+            except Exception as e:
+                logger.error(f"Error querying exchange notional: {e}")
+                exchange_notional = local_notional
+
+        current_active = max(local_notional, exchange_notional)
         staged_pending = sum(po['limit_price'] * po['qty'] for po in self.pending_orders.values() if po is not None)
         total_committed = current_active + staged_pending
         
+        # 4. Check Aggregate Portfolio Leverage Ceiling (Strict 1.85x Headroom / 2.0x Hard Ceiling)
         max_allowable = (cash * LEVERAGE_HEADROOM_CAP) - total_committed
         if max_allowable < MIN_NOTIONAL:
+            logger.warning(f"LEVERAGE CEILING: total_committed=${total_committed:,.2f} against cap ${(cash * LEVERAGE_HEADROOM_CAP):,.2f} (Headroom: ${max_allowable:,.2f} < ${MIN_NOTIONAL}). Staging rejected.")
             return
             
+        # 5. Position Sizing with Volatility Risk (2.0% equity risk)
         risk_amt = cash * RISK_PER_TRADE
         qty = risk_amt / stop_dist
         notional = qty * limit_target
+
+        # 6. Anti-Concentration Guard: Hard Cap on Single Asset Exposure (65% of equity)
+        max_single_asset_notional = cash * MAX_SINGLE_ASSET_EXPOSURE
+        if notional > max_single_asset_notional:
+            logger.info(f"CONCENTRATION CLAMP: {symbol} requested notional ${notional:,.2f} exceeds single-asset cap ${max_single_asset_notional:,.2f} ({MAX_SINGLE_ASSET_EXPOSURE*100:.0f}% equity). Clamping.")
+            notional = max_single_asset_notional
+            qty = notional / limit_target
         
+        # 7. Clamp to System Maximum Notional Cap
         if notional > MAX_NOTIONAL_CAP:
             notional = MAX_NOTIONAL_CAP
             qty = notional / limit_target
+
+        # 8. Clamp to Remaining Portfolio Headroom
         if notional > max_allowable:
+            logger.info(f"LEVERAGE CLAMP: Clamping {symbol} notional from ${notional:,.2f} to remaining headroom ${max_allowable:,.2f}")
             notional = max_allowable
             qty = notional / limit_target
+
         if notional < MIN_NOTIONAL:
             if (MIN_NOTIONAL / limit_target) * stop_dist <= cash * 0.04:
                 qty = MIN_NOTIONAL / limit_target
                 notional = MIN_NOTIONAL
             else:
+                logger.warning(f"ORDER SIZING: Notional ${notional:,.2f} below min ${MIN_NOTIONAL} with excessive risk. Staging rejected.")
                 return
                 
+        # 9. Final Fail-Safe: Hard Portfolio Leverage Breach Check
         if (total_committed + notional) > (cash * LEVERAGE_HEADROOM_CAP + 1e-6):
+            logger.warning(f"HARD LEVERAGE CHECK: Committed+Notional ${(total_committed + notional):,.2f} > Cap ${(cash * LEVERAGE_HEADROOM_CAP):,.2f}. Staging rejected.")
             return
             
         order_dict = {
@@ -572,7 +671,7 @@ class TamaLiveEngine:
                 logger.error(f"Error submitting order to Binance: {e}")
                 
         self.pending_orders[symbol] = order_dict
-        logger.info(f"STAGED {side} {symbol} Limit @ ${limit_target:,.2f} | Stop: ${sl:,.2f} | Notional: ${notional:,.2f}")
+        logger.info(f"STAGED {side} {symbol} Limit @ ${limit_target:,.2f} | Stop: ${sl:,.2f} | Notional: ${notional:,.2f} (Current Lev: {total_committed/cash:.2f}x -> New: {(total_committed+notional)/cash:.2f}x)")
 
     def _periodic_health_check(self):
         """Runs every 180 seconds to log account status and sync exchange margin."""
@@ -581,7 +680,6 @@ class TamaLiveEngine:
                 time.sleep(180.0)
                 cash = self.state.get_latest_cash_balance()
                 open_notional = sum(p['notional'] for p in self.positions.values() if p is not None)
-                lev = open_notional / cash if cash > 0 else 0.0
                 active_count = sum(1 for p in self.positions.values() if p is not None)
                 
                 # Fetch live exchange margin if connected
@@ -592,13 +690,19 @@ class TamaLiveEngine:
                             self.exchange_balance = float(acc.get('totalWalletBalance', self.exchange_balance))
                             self.unrealized_pnl = float(acc.get('totalUnrealizedProfit', 0.0))
                             self.total_margin_balance = float(acc.get('totalMarginBalance', self.exchange_balance + self.unrealized_pnl))
+                            # Track live exchange positions for notional accuracy
+                            ex_pos = acc.get('positions', [])
+                            live_notional = sum(abs(float(p.get('positionAmt', 0)) * float(p.get('entryPrice', 0))) for p in ex_pos)
+                            if live_notional > 0:
+                                open_notional = max(open_notional, live_notional)
                     except Exception as e:
                         logger.warning(f"Error updating exchange balance: {e}")
                         
+                lev = open_notional / cash if cash > 0 else 0.0
                 self.state.record_snapshot(
                     cash_balance=cash,
                     total_equity=cash,
-                    margin_used=open_notional / 3.0,
+                    margin_used=open_notional / MAX_PORTFOLIO_LEVERAGE,
                     unrealized_pnl=self.unrealized_pnl,
                     gross_exposure=open_notional,
                     portfolio_leverage=lev,

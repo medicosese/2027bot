@@ -14,8 +14,9 @@ SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
 
 # Core Risk & Execution Rules
 RISK_PER_TRADE = 0.02           # Strict 2.0% equity risk per trade
-MAX_PORTFOLIO_LEVERAGE = 3.0    # Hard 3.0x aggregate gross exposure ceiling
-LEVERAGE_HEADROOM_CAP = 2.88    # 2.88x dynamic sizing cap (guarantees zero gap/fee breach)
+MAX_PORTFOLIO_LEVERAGE = 2.0    # Institutional 2.0x aggregate gross exposure ceiling
+LEVERAGE_HEADROOM_CAP = 1.85    # 1.85x dynamic sizing cap (guarantees zero gap/fee breach)
+MAX_SINGLE_ASSET_EXPOSURE = 0.65 # Max 65% of equity per single asset (anti-concentration guard)
 COOLDOWN_BARS = 4               # 4 bars (60 minutes) post-exit cooldown per symbol
 FILL_PENETRATION_ATR = 0.1      # Maker Limit pullback offset (0.1 x ATR)
 
