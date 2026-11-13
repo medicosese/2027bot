@@ -274,7 +274,7 @@ class BinanceTradeBridge:
         sym = symbol.upper()
         res = self._send_signed_request('DELETE', '/fapi/v1/allOpenOrders', {'symbol': sym})
         try:
-            self._send_signed_request('DELETE', '/fapi/v1/algo/allOpenOrders', {'symbol': sym})
+            self._send_signed_request('DELETE', '/fapi/v1/algoOpenOrders', {'symbol': sym})
         except Exception:
             pass
         return res

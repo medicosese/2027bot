@@ -63,6 +63,8 @@ class TamaLiveEngine:
         self.latest_prices: Dict[str, float] = {s: 0.0 for s in SYMBOLS}
         self.last_kline_time: Optional[str] = None
         self.kline_messages_received: int = 0
+        self.unrealized_pnl: float = 0.0
+        self.total_margin_balance: float = 0.0
         
         # Recover open positions from SQLite if resuming
         self._recover_state()
@@ -573,10 +575,10 @@ class TamaLiveEngine:
         logger.info(f"STAGED {side} {symbol} Limit @ ${limit_target:,.2f} | Stop: ${sl:,.2f} | Notional: ${notional:,.2f}")
 
     def _periodic_health_check(self):
-        """Runs every 60 seconds to log account status and sync exchange margin."""
+        """Runs every 180 seconds to log account status and sync exchange margin."""
         while self.running:
             try:
-                time.sleep(60.0)
+                time.sleep(180.0)
                 cash = self.state.get_latest_cash_balance()
                 open_notional = sum(p['notional'] for p in self.positions.values() if p is not None)
                 lev = open_notional / cash if cash > 0 else 0.0
@@ -584,20 +586,25 @@ class TamaLiveEngine:
                 
                 # Fetch live exchange margin if connected
                 if self.bridge:
-                    ex_bal = self.bridge.get_balance()
-                    if ex_bal is not None:
-                        self.exchange_balance = ex_bal
+                    try:
+                        acc = self.bridge.get_account_info()
+                        if isinstance(acc, dict) and 'totalWalletBalance' in acc:
+                            self.exchange_balance = float(acc.get('totalWalletBalance', self.exchange_balance))
+                            self.unrealized_pnl = float(acc.get('totalUnrealizedProfit', 0.0))
+                            self.total_margin_balance = float(acc.get('totalMarginBalance', self.exchange_balance + self.unrealized_pnl))
+                    except Exception as e:
+                        logger.warning(f"Error updating exchange balance: {e}")
                         
                 self.state.record_snapshot(
                     cash_balance=cash,
                     total_equity=cash,
                     margin_used=open_notional / 3.0,
-                    unrealized_pnl=0.0,
+                    unrealized_pnl=self.unrealized_pnl,
                     gross_exposure=open_notional,
                     portfolio_leverage=lev,
                     open_count=active_count
                 )
-                logger.info(f"[HEALTH CHECK] Working Equity: ${cash:,.2f} | Exchange Wallet: ${self.exchange_balance:,.2f} | Active: {active_count} | Lev: {lev:.2f}x")
+                logger.info(f"[HEALTH CHECK] Working Equity: ${cash:,.2f} | Exchange Wallet: ${self.exchange_balance:,.2f} | Equity: ${self.total_margin_balance:,.2f} (UnPnL: ${self.unrealized_pnl:+,.2f}) | Active: {active_count} | Lev: {lev:.2f}x")
             except Exception as e:
                 logger.warning(f"Health check error: {e}")
 

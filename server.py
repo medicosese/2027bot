@@ -44,6 +44,8 @@ class TamaHealthHandler(BaseHTTPRequestHandler):
             live_prices = dict(GLOBAL_ENGINE.latest_prices) if GLOBAL_ENGINE else {}
             pending = {s: o for s, o in GLOBAL_ENGINE.pending_orders.items() if o is not None} if GLOBAL_ENGINE else {}
             ex_bal = GLOBAL_ENGINE.exchange_balance if GLOBAL_ENGINE and GLOBAL_ENGINE.exchange_balance > 0 else stats.get("exchange_balance", 0.0)
+            ex_unpnl = GLOBAL_ENGINE.unrealized_pnl if GLOBAL_ENGINE else 0.0
+            total_net_eq = GLOBAL_ENGINE.total_margin_balance if (GLOBAL_ENGINE and GLOBAL_ENGINE.total_margin_balance > 0) else (ex_bal + ex_unpnl)
             
             payload = {
                 "status": "HEALTHY_ONLINE",
@@ -61,6 +63,8 @@ class TamaHealthHandler(BaseHTTPRequestHandler):
                 },
                 "account_metrics": {
                     "exchange_wallet_balance_usdt": ex_bal,
+                    "total_exchange_equity_usdt": total_net_eq,
+                    "unrealized_floating_profit_usdt": ex_unpnl,
                     "strategy_working_equity_usdt": stats.get("total_equity", 0.0),
                     "cash_balance_usdt": stats.get("cash_balance", 0.0),
                     "realized_net_pnl_usdt": stats.get("net_pnl", 0.0),
