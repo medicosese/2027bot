@@ -31,6 +31,9 @@ class TamaHealthHandler(BaseHTTPRequestHandler):
             if self.path == "/logs":
                 self._handle_logs()
                 return
+            if self.path == "/trades_data":
+                self._handle_trades_data()
+                return
 
             sm = StateManager()
             stats = sm.get_summary_stats()
@@ -122,6 +125,37 @@ class TamaHealthHandler(BaseHTTPRequestHandler):
             self.send_header('Content-Type', 'text/plain')
             self.end_headers()
             self.wfile.write(f"Error fetching logs: {e}".encode('utf-8'))
+
+    def _handle_trades_data(self):
+        try:
+            import sqlite3
+            from config import DB_PATH
+            if not os.path.exists(DB_PATH):
+                body = json.dumps({"error": "DB not found", "trades": [], "events": [], "snapshots": []}).encode('utf-8')
+            else:
+                conn = sqlite3.connect(DB_PATH)
+                conn.row_factory = sqlite3.Row
+                cur = conn.cursor()
+                cur.execute("SELECT * FROM trades ORDER BY rowid ASC")
+                trades = [dict(r) for r in cur.fetchall()]
+                cur.execute("SELECT * FROM events ORDER BY rowid ASC")
+                events = [dict(r) for r in cur.fetchall()]
+                cur.execute("SELECT * FROM account_snapshots ORDER BY rowid ASC")
+                snaps = [dict(r) for r in cur.fetchall()]
+                conn.close()
+                data = {"trades": trades, "events": events, "snapshots": snaps}
+                body = json.dumps(data, indent=2).encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception as e:
+            self.send_response(500)
+            self.send_header('Content-Type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(f"Error fetching trades: {e}".encode('utf-8'))
 
 def run_http_server():
     server_address = ('', PORT)
