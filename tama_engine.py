@@ -124,35 +124,65 @@ class TamaLiveEngine:
             logger.info(f"Recovered active position from DB: {s} {p['side']} {p['qty']} @ ${p['entry_price']:.2f}")
 
         # Synchronize directly with Binance Exchange Ground Truth
-        if self.bridge:
-            try:
-                live_pos = self.bridge.get_open_positions()
-                for lp in live_pos:
-                    s = lp.get('symbol')
-                    amt = float(lp.get('positionAmt', 0))
-                    if s in SYMBOLS and amt != 0:
-                        side = 'LONG' if amt > 0 else 'SHORT'
-                        entry_p = float(lp.get('entryPrice', 0))
-                        mark_p = float(lp.get('markPrice', entry_p))
-                        notional = abs(amt * mark_p)
-                        self.positions[s] = {
-                            'trade_id': f"REC-{int(time.time()*1000)}",
-                            'symbol': s,
-                            'side': side,
-                            'entry_time': datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                            'entry_price': entry_p,
-                            'qty': abs(amt),
-                            'notional': notional,
-                            'sl': entry_p * 1.05 if side == 'SHORT' else entry_p * 0.95,
-                            'entry_fee': 0.0,
-                            'cum_funding': 0.0,
-                            'bars_held': 1,
-                            'exchange_order_id': None,
-                            'stop_order_id': None
-                        }
-                        logger.info(f"Synchronized live exchange position on startup: {s} {side} {abs(amt)} @ ${entry_p:,.2f} (Notional: ${notional:,.2f})")
-            except Exception as e:
-                logger.error(f"Error recovering live exchange positions: {e}")
+        self.sync_live_exchange_positions()
+
+    def sync_live_exchange_positions(self):
+        """Continuously reconciles in-memory positions with Binance Exchange Ground Truth."""
+        if not self.bridge or ORDER_EXECUTION_MODE != "LIVE_ORDERS":
+            return
+            
+        try:
+            live_positions = self.bridge.get_open_positions()
+            live_map = {}
+            for lp in live_positions:
+                s = lp.get('symbol')
+                amt = float(lp.get('positionAmt', 0))
+                if s in SYMBOLS and amt != 0:
+                    live_map[s] = lp
+
+            # 1. Update or create positions that exist on Binance
+            for s, lp in live_map.items():
+                amt = float(lp.get('positionAmt', 0))
+                side = 'LONG' if amt > 0 else 'SHORT'
+                entry_p = float(lp.get('entryPrice', 0))
+                mark_p = float(lp.get('markPrice', entry_p))
+                notional = abs(amt * mark_p)
+                
+                if self.positions.get(s) is None:
+                    df = self.bars.get(s)
+                    init_sl = entry_p * 1.05 if side == 'SHORT' else entry_p * 0.95
+                    if df is not None and not df.empty and 'st' in df.columns:
+                        init_sl = float(df['st'].iloc[-1])
+                        
+                    self.positions[s] = {
+                        'trade_id': f"SYNC-{int(time.time()*1000)}",
+                        'symbol': s,
+                        'side': side,
+                        'entry_time': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                        'entry_price': entry_p,
+                        'qty': abs(amt),
+                        'notional': notional,
+                        'sl': init_sl,
+                        'entry_fee': 0.0,
+                        'cum_funding': 0.0,
+                        'bars_held': 1,
+                        'exchange_order_id': None,
+                        'stop_order_id': None
+                    }
+                    logger.info(f"Dynamically synchronized new active position from Binance: {s} {side} {abs(amt)} @ ${entry_p:,.2f} | Stop: ${init_sl:,.2f}")
+                else:
+                    self.positions[s]['qty'] = abs(amt)
+                    self.positions[s]['notional'] = notional
+                    self.positions[s]['entry_price'] = entry_p
+
+            # 2. Clear positions in memory that no longer exist on Binance
+            for s in SYMBOLS:
+                if s not in live_map and self.positions.get(s) is not None:
+                    logger.info(f"Position {s} closed on exchange (external exit or stop hit). Clearing local position.")
+                    self.positions[s] = None
+                    self.last_exit_bar[s] = self.bar_index.get(s, 0)
+        except Exception as e:
+            logger.error(f"Error during live exchange position synchronization: {e}")
 
     def fetch_warmup_candles(self, symbol: str, limit: int = WARMUP_BARS) -> pd.DataFrame:
         url = "https://fapi.binance.com/fapi/v1/klines"
@@ -461,6 +491,9 @@ class TamaLiveEngine:
 
     def on_candle_close(self, symbol: str, candle: Dict[str, Any]):
         """Called strictly on 15m candle close to update indicators, trail stops, and generate signals."""
+        # Reconcile in-memory state with Binance Exchange Ground Truth
+        self.sync_live_exchange_positions()
+
         df = self.bars[symbol]
         new_row = {
             'timestamp': candle['t'],
@@ -486,17 +519,20 @@ class TamaLiveEngine:
         st_v = df['st'].iloc[-1]
         st_d = df['st_dir'].iloc[-1]
         
-        # 1. Check Exit for Active Position
+        # 1. Check Exit / Trailing Stop for Active Position
         pos = self.positions[symbol]
         if pos is not None:
             pos['bars_held'] += 1
             if pos['side'] == 'LONG':
                 old_sl = pos['sl']
                 pos['sl'] = max(pos['sl'], st_v)
-                if pos['sl'] > old_sl and ORDER_EXECUTION_MODE == "LIVE_ORDERS" and self.bridge:
+                need_update = (pos['sl'] > old_sl) or (pos.get('stop_order_id') is None)
+                if need_update and ORDER_EXECUTION_MODE == "LIVE_ORDERS" and self.bridge:
                     try:
                         self.bridge.cancel_all_orders(symbol)
-                        self.bridge.place_stop_loss_order(symbol, "SELL", pos['sl'])
+                        res = self.bridge.place_stop_loss_order(symbol, "SELL", pos['sl'])
+                        if isinstance(res, dict) and 'orderId' in res:
+                            pos['stop_order_id'] = res['orderId']
                         logger.info(f"Updated Exchange Trailing Stop for {symbol} to ${pos['sl']:.2f}")
                     except Exception as e:
                         logger.error(f"Error updating exchange trailing stop: {e}")
@@ -505,10 +541,13 @@ class TamaLiveEngine:
             else:
                 old_sl = pos['sl']
                 pos['sl'] = min(pos['sl'], st_v)
-                if pos['sl'] < old_sl and ORDER_EXECUTION_MODE == "LIVE_ORDERS" and self.bridge:
+                need_update = (pos['sl'] < old_sl) or (pos.get('stop_order_id') is None)
+                if need_update and ORDER_EXECUTION_MODE == "LIVE_ORDERS" and self.bridge:
                     try:
                         self.bridge.cancel_all_orders(symbol)
-                        self.bridge.place_stop_loss_order(symbol, "BUY", pos['sl'])
+                        res = self.bridge.place_stop_loss_order(symbol, "BUY", pos['sl'])
+                        if isinstance(res, dict) and 'orderId' in res:
+                            pos['stop_order_id'] = res['orderId']
                         logger.info(f"Updated Exchange Trailing Stop for {symbol} to ${pos['sl']:.2f}")
                     except Exception as e:
                         logger.error(f"Error updating exchange trailing stop: {e}")
@@ -519,7 +558,11 @@ class TamaLiveEngine:
         if self.pending_orders[symbol] is not None:
             if ORDER_EXECUTION_MODE == "LIVE_ORDERS" and self.bridge:
                 try:
-                    self.bridge.cancel_all_orders(symbol)
+                    p_order = self.pending_orders[symbol]
+                    if p_order.get('exchange_order_id'):
+                        self.bridge.cancel_order(symbol, p_order['exchange_order_id'])
+                    else:
+                        self.bridge.cancel_all_orders(symbol)
                 except Exception as e:
                     logger.error(f"Error cancelling stale limit order: {e}")
             self.pending_orders[symbol] = None
@@ -678,9 +721,6 @@ class TamaLiveEngine:
         while self.running:
             try:
                 time.sleep(180.0)
-                cash = self.state.get_latest_cash_balance()
-                open_notional = sum(p['notional'] for p in self.positions.values() if p is not None)
-                active_count = sum(1 for p in self.positions.values() if p is not None)
                 
                 # Fetch live exchange margin if connected
                 if self.bridge:
@@ -690,18 +730,23 @@ class TamaLiveEngine:
                             self.exchange_balance = float(acc.get('totalWalletBalance', self.exchange_balance))
                             self.unrealized_pnl = float(acc.get('totalUnrealizedProfit', 0.0))
                             self.total_margin_balance = float(acc.get('totalMarginBalance', self.exchange_balance + self.unrealized_pnl))
-                            # Track live exchange positions for notional accuracy
-                            ex_pos = acc.get('positions', [])
-                            live_notional = sum(abs(float(p.get('positionAmt', 0)) * float(p.get('entryPrice', 0))) for p in ex_pos)
-                            if live_notional > 0:
-                                open_notional = max(open_notional, live_notional)
                     except Exception as e:
                         logger.warning(f"Error updating exchange balance: {e}")
                         
+                    # Reconcile in-memory positions with Binance ground truth
+                    self.sync_live_exchange_positions()
+
+                cash = self.state.get_latest_cash_balance()
+                if CAPITAL_MODE == "EXCHANGE_DYNAMIC" and self.exchange_balance > 0:
+                    cash = self.exchange_balance
+
+                open_notional = sum(p['notional'] for p in self.positions.values() if p is not None)
+                active_count = sum(1 for p in self.positions.values() if p is not None)
                 lev = open_notional / cash if cash > 0 else 0.0
+                
                 self.state.record_snapshot(
                     cash_balance=cash,
-                    total_equity=cash,
+                    total_equity=cash + self.unrealized_pnl,
                     margin_used=open_notional / MAX_PORTFOLIO_LEVERAGE,
                     unrealized_pnl=self.unrealized_pnl,
                     gross_exposure=open_notional,
